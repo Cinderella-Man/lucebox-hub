@@ -7,7 +7,7 @@
 <p align="center">
   The first megakernel for hybrid DeltaNet/Attention LLMs.<br/>
   All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch.<br/>
-  <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://lucebox.com">lucebox.com</a>
+  <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/NjweHTtTVj">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
 
 ---
@@ -50,6 +50,10 @@ model.py             Weight loading + Decoder
 setup.py             Build
 bench_pp_tg.py       Benchmark
 ```
+
+## Community
+
+Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/NjweHTtTVj).
 
 ---
 
