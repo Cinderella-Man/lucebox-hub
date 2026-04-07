@@ -8,7 +8,7 @@
   <strong>The first megakernel for hybrid DeltaNet/Attention LLMs.</strong><br/>
   All 24 layers of Qwen 3.5-0.8B in a single CUDA dispatch.<br/>
   1.87 tok/J on a 2020 GPU, matching Apple's latest silicon at 2x the throughput.<br/><br/>
-  <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/NjweHTtTVj">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
+  <a href="https://lucebox.com/blog/megakernel">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
 </p>
 
 ---
@@ -151,7 +151,7 @@ The goal is to demonstrate that architecture-specific kernel fusion eliminates a
 
 ## Files
 
-Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/NjweHTtTVj).
+Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/yHfswqZmJQ).
 
 ## Citation
 
@@ -175,7 +175,7 @@ llama.cpp is the most widely used local inference engine. It's what most people 
 Deliberately chosen as the "worst case" for NVIDIA: a 2020 GPU, widely dismissed as power-hungry, available for ~$900-1,000 used. If the software gap is real on old hardware, it's even larger on newer cards.
 ## Community
 
-Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/NjweHTtTVj).
+Questions, ideas, or want to see what others are building? Join the [Luce Discord](https://discord.gg/yHfswqZmJQ).
 
 ---
 
