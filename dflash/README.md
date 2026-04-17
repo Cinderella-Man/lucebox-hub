@@ -6,10 +6,6 @@
   <img src="hero.png" width="600" />
 </p>
 
-<p align="center">
-  <img src="demo.gif" width="600" />
-</p>
-
 <h1 align="center">Luce DFlash</h1>
 
 <p align="center">
@@ -17,6 +13,10 @@
   Qwen3.5-27B at 135 tok/s on a single RTX 3090. 128K context on 24 GB.<br/>
   3.5x faster than chain speculative decoding, 2.9x faster than SGLang AWQ.<br/><br/>
   <a href="https://lucebox.com/blog/dflash">Blog post</a> · <a href="RESULTS.md">Benchmarks</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a> · <a href="https://lucebox.com">lucebox.com</a>
+</p>
+
+<p align="center">
+  <img src="demo.gif" width="600" />
 </p>
 
 ---

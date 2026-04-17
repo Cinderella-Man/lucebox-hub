@@ -86,27 +86,34 @@ What we ported and tuned:
 
 ## Why this exists
 
-Local AI should be a default, not a privilege. Running capable models on your own machine keeps your data private, skips the per-token bill, and removes the vendor dependency. The hardware to do it already sits on desks: an RTX 3090, a Ryzen AI MAX+ 395, an Apple M-series chip. The software to run those chips well doesn't.
+Local AI should be a default, not a privilege: private data, no per-token bill, no vendor lock-in. The hardware to run capable models already sits on desks. The software to run those chips well doesn't.
 
-General-purpose frameworks won the last decade for a reason: hand-tuning a kernel for every chip and every model was too expensive to justify. So everyone ships one stack that's decent on everything and great on nothing. Most of the silicon's capability stays on the floor.
+General-purpose frameworks dominated the last decade because hand-tuning kernels per chip was too expensive to justify. One stack, decent on everything, great on nothing. Most of the silicon's capability stays on the floor.
 
-That calculus is flipping. AI-assisted development makes per-chip, per-model rewrites tractable in days instead of months. A kernel that would have taken a small team a quarter now fits inside a single release cycle. Lucebox is where we publish those rewrites: one chip, one model family, one optimization problem at a time. Each artifact ships standalone, a kernel, a spec-decode port, a benchmark harness, with full writeup and MIT source. Together they build toward a single command surface, `lucebox`, that makes local inference on consumer chips a one-line install.
+AI-assisted development flips that calculus. Rewrites that took a quarter now fit in a release cycle. Lucebox is where we publish them, one chip and one model family at a time. MIT source, full writeup, reproducible benchmarks.
 
 ---
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/Luce-Org/lucebox-hub
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
 cd lucebox-hub
 
 # megakernel (Qwen 3.5-0.8B, batch 1)
-cd megakernel && pip install -e . && python final_bench.py
+cd megakernel && pip install -e . && python final_bench.py && cd ..
 
-# dflash 27B                                                [coming soon]
+# dflash 27B (Qwen 3.5-27B Q4_K_M + z-lab draft, RTX 3090)
+cd dflash
+cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target test_dflash -j
+huggingface-cli download unsloth/Qwen3.5-27B-GGUF Qwen3.5-27B-Q4_K_M.gguf --local-dir models/
+huggingface-cli download z-lab/Qwen3.5-27B-DFlash model.safetensors --local-dir models/draft/
+python3 scripts/run.py --prompt "def fibonacci(n):"
 ```
 
 **Requirements:** NVIDIA GPU (Ampere+), CUDA 12+, PyTorch 2.0+. Tested on RTX 3090 (2020).
+Use `--recurse-submodules` to pull the pinned `Luce-Org/llama.cpp@luce-dflash` fork that carries the three tree-mode ggml ops.
 
 **Optional, find your GPU's sweet spot:** `sudo nvidia-smi -pl 220`
 
