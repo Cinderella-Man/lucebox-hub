@@ -61,6 +61,23 @@ class ChatRequest(BaseModel):
     top_p: float | None = None
 
 
+class AnthropicMessage(BaseModel):
+    role: str
+    # Anthropic allows either a plain string or a list of content blocks.
+    content: str | list[dict]
+
+
+class AnthropicMessagesRequest(BaseModel):
+    model: str = MODEL_NAME
+    max_tokens: int
+    messages: list[AnthropicMessage]
+    system: str | list[dict] | None = None
+    stream: bool = False
+    temperature: float | None = None
+    top_p: float | None = None
+    stop_sequences: list[str] | None = None
+
+
 def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: int,
               tokenizer: AutoTokenizer, stop_ids: set[int]) -> FastAPI:
     import asyncio
@@ -193,6 +210,124 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
             "usage": {"prompt_tokens": 0,  # not tracked yet
                       "completion_tokens": len(tokens),
                       "total_tokens": len(tokens)},
+        })
+
+    # ── Anthropic Messages API ──────────────────────────────────────
+    # Mirrors the OpenAI endpoint but formatted for the Anthropic SDK.
+    # `?beta=true` (or any other query params) are accepted and ignored.
+
+    def _anthropic_text_from_content(content) -> str:
+        if isinstance(content, str):
+            return content
+        # list of blocks — concatenate the text blocks, ignore images/tools
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+        return "".join(parts)
+
+    def _tokenize_anthropic(req: AnthropicMessagesRequest) -> tuple[Path, int]:
+        msgs = []
+        system_text = _anthropic_text_from_content(req.system) if req.system else None
+        if system_text:
+            msgs.append({"role": "system", "content": system_text})
+        for m in req.messages:
+            msgs.append({"role": m.role,
+                         "content": _anthropic_text_from_content(m.content)})
+        prompt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+        tmp = Path(tempfile.mkstemp(suffix=".bin")[1])
+        with open(tmp, "wb") as f:
+            for t in ids:
+                f.write(struct.pack("<i", int(t)))
+        return tmp, len(ids)
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(req: AnthropicMessagesRequest):
+        prompt_bin, prompt_len = _tokenize_anthropic(req)
+
+        available_gen = max_ctx - prompt_len - 20
+        gen_len = min(req.max_tokens, available_gen)
+        if gen_len <= 0:
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "invalid_request_error",
+                           "message": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}},
+                status_code=400)
+
+        msg_id = "msg_" + uuid.uuid4().hex[:24]
+
+        if req.stream:
+            async def sse() -> AsyncIterator[str]:
+                async with daemon_lock:
+                    cmd_line = f"{prompt_bin} {gen_len}\n"
+                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                    daemon_proc.stdin.flush()
+
+                message_start = {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id, "type": "message", "role": "assistant",
+                        "model": req.model or MODEL_NAME,
+                        "content": [], "stop_reason": None, "stop_sequence": None,
+                        "usage": {"input_tokens": prompt_len, "output_tokens": 0},
+                    },
+                }
+                yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+                cb_start = {
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
+
+                out_tokens = 0
+                try:
+                    for tok_id in _token_stream(r_pipe, req.max_tokens):
+                        out_tokens += 1
+                        delta = {
+                            "type": "content_block_delta", "index": 0,
+                            "delta": {"type": "text_delta",
+                                      "text": tokenizer.decode([tok_id])},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                finally:
+                    try: prompt_bin.unlink()
+                    except Exception: pass
+
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+                msg_delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": out_tokens},
+                }
+                yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
+                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+
+            return StreamingResponse(sse(), media_type="text/event-stream")
+
+        # Non-streaming
+        async with daemon_lock:
+            cmd_line = f"{prompt_bin} {gen_len}\n"
+            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+            daemon_proc.stdin.flush()
+            tokens = list(_token_stream(r_pipe, gen_len))
+
+        try: prompt_bin.unlink()
+        except Exception: pass
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        return JSONResponse({
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": req.model or MODEL_NAME,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": prompt_len,
+                      "output_tokens": len(tokens)},
         })
 
     return app
