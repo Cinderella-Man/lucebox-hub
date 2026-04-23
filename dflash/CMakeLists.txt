@@ -50,7 +50,16 @@ add_library(dflash27b STATIC
     src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
-set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "86")
+# Ampere (86) always; Blackwell consumer (120) added if nvcc supports it
+# (CUDA 12.8+), GB10/Jetson Thor (121) added at CUDA 12.9+.
+set(_dflash27b_archs "86")
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+    list(APPEND _dflash27b_archs "120")
+endif()
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
+    list(APPEND _dflash27b_archs "121")
+endif()
+set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "${_dflash27b_archs}")
 
 target_include_directories(dflash27b
     PUBLIC
