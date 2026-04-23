@@ -20,6 +20,7 @@ import json
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -36,7 +37,7 @@ from transformers import AutoTokenizer
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TARGET = ROOT / "models" / "Qwen3.5-27B-Q4_K_M.gguf"
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
-DEFAULT_BIN = ROOT / "build" / "test_dflash"
+DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
 MODEL_NAME = "luce-dflash"
 
@@ -68,12 +69,29 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
     daemon_lock = asyncio.Lock()
 
     r_pipe, w_pipe = os.pipe()
-    cmd = [str(bin_path), str(target), str(draft), "--daemon",
+    if sys.platform == "win32":
+        import msvcrt
+        os.set_inheritable(w_pipe, True)
+        stream_fd_val = int(msvcrt.get_osfhandle(w_pipe))
+    else:
+        stream_fd_val = w_pipe
+
+    bin_abs = str(Path(bin_path).resolve())
+    dll_dir = str(Path(bin_abs).parent / "bin")
+    env = {**os.environ}
+    if sys.platform == "win32":
+        env["PATH"] = dll_dir + os.pathsep + str(Path(bin_abs).parent) + os.pathsep + env.get("PATH", "")
+
+    cmd = [bin_abs, str(target), str(draft), "--daemon",
            "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
            f"--max-ctx={max_ctx}",
-           f"--stream-fd={w_pipe}"]
-    daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,),
-                                   stdin=subprocess.PIPE)
+           f"--stream-fd={stream_fd_val}"]
+    if sys.platform == "win32":
+        daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
+                                       stdin=subprocess.PIPE)
+    else:
+        daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), env=env,
+                                       stdin=subprocess.PIPE)
     os.close(w_pipe)
 
     @app.get("/v1/models")
@@ -205,7 +223,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--target", type=Path, default=DEFAULT_TARGET)
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
