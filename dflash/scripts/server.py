@@ -48,6 +48,47 @@ def resolve_draft(root: Path) -> Path:
     raise FileNotFoundError(f"no model.safetensors under {root}")
 
 
+# Models known to share the qwen35 GGUF arch + vocab. Verified via
+# tokenizer.ggml.pre == "qwen35" and identical eos/pad/bos token IDs.
+_QWEN35_FAMILY_TOKENIZERS = {
+    "Qwen3.5-27B": "Qwen/Qwen3.5-27B",
+    "Qwen3.6-27B": "Qwen/Qwen3.6-27B",
+}
+
+
+def _tokenizer_id_from_gguf(gguf_path: Path) -> str:
+    """Infer the HuggingFace tokenizer repo from a GGUF target file.
+
+    The GGUF file encodes its own tokenizer so in principle we could use that
+    directly, but `test_dflash` drives generation through the HF tokenizer for
+    chat-template application. We match on `general.basename` / `general.name`
+    metadata; if anything goes wrong we fall back to the historical default
+    (Qwen/Qwen3.5-27B) so existing setups don't break.
+    """
+    default = "Qwen/Qwen3.5-27B"
+    try:
+        from gguf import GGUFReader  # type: ignore
+        r = GGUFReader(str(gguf_path))
+        for key in ("general.basename", "general.name"):
+            f = r.fields.get(key)
+            if f is None or not f.data:
+                continue
+            import numpy as np
+            p = f.parts[f.data[0]]
+            if not isinstance(p, np.ndarray):
+                continue
+            try:
+                val = bytes(p).decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            for known, repo in _QWEN35_FAMILY_TOKENIZERS.items():
+                if known.lower() in val.lower():
+                    return repo
+    except Exception:
+        pass
+    return default
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -228,8 +269,19 @@ def main():
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
-    default_ctx = 131072 if os.environ.get("DFLASH27B_KV_Q4") == "1" else 6144
-    ap.add_argument("--max-ctx", type=int, default=default_ctx, help="Maximum context length")
+    # Attention compute currently scales with --max-ctx, not the actual
+    # prompt+gen length (see https://github.com/Luce-Org/lucebox-hub/issues/10).
+    # Default 16384 fits most API workloads without the 20×+ slowdown users
+    # hit with --max-ctx=131072 on short requests. Bump via --max-ctx if you
+    # actually need long-context serving.
+    default_ctx = 16384
+    ap.add_argument("--max-ctx", type=int, default=default_ctx,
+                    help=f"Maximum context length (default: {default_ctx}; "
+                         "oversizing this — e.g. 131072 on short prompts — "
+                         "can slow attention 20×+ until issue #10 is fixed)")
+    ap.add_argument("--tokenizer", type=str, default=None,
+                    help="HuggingFace tokenizer repo ID (default: auto-detect "
+                         "from target GGUF basename; falls back to Qwen/Qwen3.5-27B)")
     ap.add_argument("--daemon", action="store_true", help="Run with persistent model daemon (now default)")
     args = ap.parse_args()
 
@@ -241,8 +293,8 @@ def main():
     if not draft.is_file():
         raise SystemExit(f"draft safetensors not found at {args.draft}")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3.5-27B", trust_remote_code=True)
+    tokenizer_id = args.tokenizer or _tokenizer_id_from_gguf(args.target)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
     stop_ids = set()
     for s in ("<|im_end|>", "<|endoftext|>"):
         ids = tokenizer.encode(s, add_special_tokens=False)
@@ -253,11 +305,12 @@ def main():
 
     import uvicorn
     print(f"Luce DFlash OpenAI server on http://{args.host}:{args.port}")
-    print(f"  target = {args.target}")
-    print(f"  draft  = {draft}")
-    print(f"  bin    = {args.bin}")
-    print(f"  budget = {args.budget}")
-    print(f"  max_ctx= {args.max_ctx}")
+    print(f"  target    = {args.target}")
+    print(f"  draft     = {draft}")
+    print(f"  bin       = {args.bin}")
+    print(f"  budget    = {args.budget}")
+    print(f"  max_ctx   = {args.max_ctx}")
+    print(f"  tokenizer = {tokenizer_id}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

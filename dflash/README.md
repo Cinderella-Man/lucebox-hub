@@ -89,6 +89,17 @@ DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen
 | Qwen3.6-27B Q4_K_M | HumanEval (10 prompts, n_gen=128) | 4.74 | 30.6% | 73.67 |
 | Qwen3.6-27B Q4_K_M | Math (10 prompts, n_gen=128) | 3.63 | 23.7% | 57.00 |
 
+Full `bench_llm.py` suite on **Qwen3.6-27B UD-Q4_K_XL** (unsloth Dynamic 2.0, 10 prompts, n_gen=256, RTX 3090 24 GB, auto-fit `--max-ctx`):
+
+| Bench | AR tok/s | DFlash tok/s | AL | Speedup |
+|---|---:|---:|---:|---:|
+| HumanEval | 34.90 | 78.16 | 5.94 | **2.24×** |
+| GSM8K | 34.89 | 59.65 | 4.43 | **1.71×** |
+| Math500 | 35.13 | 69.77 | 5.15 | **1.99×** |
+| **Mean** | 34.97 | 69.19 | 5.17 | **1.98×** |
+
+Compare to Qwen3.5-27B on the same harness: 2.87× / 2.21× / 2.56× — cross-generation drop of ~22% uniformly from the draft mismatch, but still a clean ~2× with zero retraining.
+
 Numbers will move once a Qwen3.6-matched DFlash draft lands; swap it in via `DFLASH_DRAFT=...` without rebuilding.
 
 ## Quick start
