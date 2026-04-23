@@ -16,8 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGET = ROOT / "models" / "Qwen3.5-27B-Q4_K_M.gguf"
-DRAFT_SEARCH_ROOT = Path.home() / ".cache/huggingface/hub/models--z-lab--Qwen3.5-27B-DFlash/snapshots"
-BIN = ROOT / "build" / "test_dflash"
+DRAFT_ROOT = ROOT / "models" / "draft"
+BIN = ROOT / "build" / ("test_dflash.exe" if sys.platform == "win32" else "test_dflash")
 
 BUDGET = 22
 N_GEN  = 512
@@ -25,9 +25,14 @@ SYSTEM = "You are a concise, helpful assistant."
 
 
 def resolve_draft() -> Path:
-    for st in DRAFT_SEARCH_ROOT.rglob("model.safetensors"):
-        return st
-    sys.exit(f"draft weights not found under {DRAFT_SEARCH_ROOT}")
+    if DRAFT_ROOT.is_file():
+        return DRAFT_ROOT
+    if DRAFT_ROOT.is_dir():
+        for st in DRAFT_ROOT.rglob("model.safetensors"):
+            return st
+    sys.exit(
+        f"draft weights not found under {DRAFT_ROOT}. Download them as documented in the README."
+    )
 
 
 def tokenize(tok, text: str, path: Path) -> int:

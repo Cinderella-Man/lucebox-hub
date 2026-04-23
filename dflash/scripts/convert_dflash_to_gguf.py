@@ -22,7 +22,7 @@ name.
 
 Usage:
   PYTHONPATH=../../dflash27b_ggml/deps/llama.cpp/gguf-py python convert_dflash_to_gguf.py \
-    /home/lucebox/.cache/huggingface/hub/models--z-lab--Qwen3.5-27B-DFlash/snapshots/.../model.safetensors \
+    models/draft/model.safetensors \
     qwen3.5-27b-dflash-draft.gguf
 """
 

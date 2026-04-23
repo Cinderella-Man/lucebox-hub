@@ -26,13 +26,21 @@ def default_paths():
 
 def resolve_draft(draft_dir: str) -> str:
     if draft_dir.endswith(".safetensors"):
-        return draft_dir
+        p = Path(draft_dir)
+        if p.is_file():
+            return str(p)
+        raise FileNotFoundError(f"draft safetensors not found: {draft_dir}")
+
     p = Path(draft_dir)
     if p.is_file():
         return str(p)
-    for st in p.rglob("model.safetensors"):
-        return str(st)
-    raise FileNotFoundError(f"no model.safetensors under {draft_dir}")
+    if p.is_dir():
+        for st in p.rglob("model.safetensors"):
+            return str(st)
+
+    raise FileNotFoundError(
+        f"no model.safetensors under {draft_dir}. Download it as documented in the README, or pass --draft explicitly."
+    )
 
 
 def tokenize(tokenizer, text: str, out_path: str) -> int:

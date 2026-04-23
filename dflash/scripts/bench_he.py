@@ -13,34 +13,25 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+BIN_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET = os.environ.get(
     "DFLASH_TARGET",
     str(ROOT / "models" / "Qwen3.5-27B-Q4_K_M.gguf"),
 )
-_DRAFT_DEFAULT_ROOT = (
-    Path.home() / ".cache/huggingface/hub"
-    / "models--z-lab--Qwen3.5-27B-DFlash" / "snapshots"
-)
-
-
-def _resolve_draft() -> str:
-    env = os.environ.get("DFLASH_DRAFT")
-    if env:
-        return env
-    for st in _DRAFT_DEFAULT_ROOT.rglob("model.safetensors"):
-        return str(st)
-    return str(_DRAFT_DEFAULT_ROOT / "model.safetensors")
-
-
-DRAFT = _resolve_draft()
+_LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "model.safetensors"
+_LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
+DRAFT = None
 TEST_DFLASH = os.environ.get(
     "DFLASH_BIN",
-    str(ROOT / "build" / "test_dflash"),
+    str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"),
 )
+TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
+TMPDIR.mkdir(parents=True, exist_ok=True)
 
 PROMPTS = [
     # (name, source_code)
@@ -187,7 +178,46 @@ PROMPTS = [
 ]
 
 
-def tokenize_prompt(prompt: str, out_path: str, tokenizer) -> int:
+def _find_safetensors(root: Path) -> str | None:
+    if root.is_file():
+        return str(root)
+    if not root.is_dir():
+        return None
+    for st in root.rglob("model.safetensors"):
+        return str(st)
+    return None
+
+
+def _resolve_draft() -> str:
+    env = os.environ.get("DFLASH_DRAFT")
+    if env:
+        found = _find_safetensors(Path(env))
+        if found:
+            return found
+        raise FileNotFoundError(f"DFLASH_DRAFT does not point to model.safetensors: {env}")
+
+    for candidate in (_LOCAL_DRAFT_FILE, _LOCAL_DRAFT_ROOT):
+        found = _find_safetensors(candidate)
+        if found:
+            return found
+
+    raise FileNotFoundError(
+        "draft model.safetensors not found. Expected one of:\n"
+        f"  - {_LOCAL_DRAFT_FILE}\n"
+        "Download it as documented in the README, or set DFLASH_DRAFT to an explicit file or directory."
+    )
+
+
+def _require_file(path: str, label: str):
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+
+
+def _prompt_path(i: int) -> Path:
+    return TMPDIR / f"he_prompt_{i:02d}.bin"
+
+
+def tokenize_prompt(prompt: str, out_path: Path, tokenizer) -> int:
     ids = tokenizer.encode(prompt, add_special_tokens=False)
     with open(out_path, "wb") as f:
         for tid in ids:
@@ -195,13 +225,13 @@ def tokenize_prompt(prompt: str, out_path: str, tokenizer) -> int:
     return len(ids)
 
 
-def run_test_dflash(prompt_path: str, n_gen: int, fast_rollback: bool,
+def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
                     ddtree_budget: int | None = None,
                     ddtree_temp: float | None = None,
                     ddtree_no_chain_seed: bool = False) -> dict:
-    out_bin = "/tmp/he_bench_out.bin"
+    out_bin = TMPDIR / "he_bench_out.bin"
     cmd = [
-        TEST_DFLASH, TARGET, DRAFT, prompt_path, str(n_gen), out_bin,
+        TEST_DFLASH, TARGET, DRAFT, str(prompt_path), str(n_gen), str(out_bin),
     ]
     if fast_rollback:
         cmd.append("--fast-rollback")
@@ -219,9 +249,9 @@ def run_test_dflash(prompt_path: str, n_gen: int, fast_rollback: bool,
 
     # Parse output
     out = r.stdout
-    m_tps = re.search(r"→\s+(\d+\.\d+)\s+tok/s", out)
-    m_commit = re.search(r"avg commit/step=(\d+\.\d+)", out)
-    m_accept = re.search(r"accepted=(\d+)/(\d+) \((\d+\.\d+)%", out)
+    m_tps = re.search(r"(\d+(?:\.\d+)?)\s+tok/s", out)
+    m_commit = re.search(r"avg commit/step=(\d+(?:\.\d+)?)", out)
+    m_accept = re.search(r"accepted=(\d+)/(\d+) \((\d+(?:\.\d+)?)%", out)
     m_steps = re.search(r"(\d+) draft steps", out)
     if not (m_tps and m_commit and m_accept and m_steps):
         print("STDOUT tail:", out[-2000:])
@@ -237,6 +267,11 @@ def run_test_dflash(prompt_path: str, n_gen: int, fast_rollback: bool,
 
 
 def main():
+    global DRAFT
+    DRAFT = _resolve_draft()
+    _require_file(TARGET, "target GGUF")
+    _require_file(TEST_DFLASH, "test_dflash binary")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-gen", type=int, default=128)
     ap.add_argument("--mode", choices=["fast", "batched"], default="fast")
@@ -249,16 +284,21 @@ def main():
                     help="Use paper's pure best-first (no chain pre-seed)")
     args = ap.parse_args()
 
+    print(f"[bench] target = {TARGET}")
+    print(f"[bench] draft  = {DRAFT}")
+    print(f"[bench] bin    = {TEST_DFLASH}")
+    print(f"[bench] tmp    = {TMPDIR}")
+
     if not args.skip_tokenize:
         print("[bench] tokenizing prompts via HF…")
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-27B", trust_remote_code=True)
         for i, (name, p) in enumerate(PROMPTS):
-            path = f"/tmp/he_prompt_{i:02d}.bin"
+            path = _prompt_path(i)
             n = tokenize_prompt(p, path, tok)
             print(f"  [{i:02d}] {name:26s}  {n:4d} tokens")
     else:
-        print("[bench] skipping tokenize (reusing /tmp/he_prompt_NN.bin)")
+        print(f"[bench] skipping tokenize (reusing {_prompt_path(0).parent})")
 
     print(f"\n[bench] mode={args.mode}  n_gen={args.n_gen}")
     print(f"{'prompt':28s}  {'steps':>6s} {'AL':>6s} {'pct%':>6s} {'tok/s':>8s}")
@@ -266,7 +306,7 @@ def main():
 
     results = []
     for i, (name, _) in enumerate(PROMPTS):
-        path = f"/tmp/he_prompt_{i:02d}.bin"
+        path = _prompt_path(i)
         try:
             r = run_test_dflash(path, args.n_gen,
                                 fast_rollback=(args.mode == "fast"),
