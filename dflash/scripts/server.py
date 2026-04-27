@@ -4,8 +4,8 @@ OpenAI-compatible HTTP server on top of test_dflash.
     pip install fastapi uvicorn transformers
     python3 scripts/server.py                 # serves on :8000
 
-    curl http://localhost:8000/v1/chat/completions \\
-        -H 'Content-Type: application/json' \\
+    curl http://localhost:8000/v1/chat/completions \
+        -H 'Content-Type: application/json' \
         -d '{"model":"luce-dflash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 
 Drop-in for Open WebUI / LM Studio / Cline by setting
@@ -17,12 +17,14 @@ binary that keeps the model resident is a planned follow-up.
 """
 import argparse
 import json
+import logging
 import os
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import AsyncIterator
@@ -32,6 +34,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import iterate_in_threadpool
 from transformers import AutoTokenizer
+
+# ── Diagnostic logger ───────────────────────────────────────────────
+log = logging.getLogger("luce.diag")
+log.setLevel(logging.DEBUG)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s %(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+log.addHandler(_handler)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -120,6 +130,22 @@ class AnthropicMessagesRequest(BaseModel):
     stop_sequences: list[str] | None = None
 
 
+def _drain_stderr(proc, label="daemon"):
+    """Background thread that reads stderr from the daemon and logs it."""
+    import threading
+
+    def _reader():
+        try:
+            for raw_line in proc.stderr:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                log.info(f"[{label} stderr] {line}")
+        except Exception as exc:
+            log.warning(f"[{label} stderr reader] died: {exc}")
+    t = threading.Thread(target=_reader, daemon=True, name=f"{label}-stderr")
+    t.start()
+    return t
+
+
 def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: int,
               tokenizer: AutoTokenizer, stop_ids: set[int]) -> FastAPI:
     import asyncio
@@ -144,13 +170,30 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
            "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
            f"--max-ctx={max_ctx}",
            f"--stream-fd={stream_fd_val}"]
+
+    log.info(f"Launching daemon: {' '.join(cmd)}")
+
     if sys.platform == "win32":
         daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
-                                       stdin=subprocess.PIPE)
+                                       stdin=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
     else:
         daemon_proc = subprocess.Popen(cmd, pass_fds=(w_pipe,), env=env,
-                                       stdin=subprocess.PIPE)
+                                       stdin=subprocess.PIPE,
+                                       stderr=subprocess.PIPE)
     os.close(w_pipe)
+
+    log.info(f"Daemon PID: {daemon_proc.pid}")
+    _drain_stderr(daemon_proc)
+
+    def _check_daemon(context: str) -> bool:
+        """Check whether the daemon is still alive. Returns True if healthy."""
+        rc = daemon_proc.poll()
+        if rc is not None:
+            log.error(f"[{context}] daemon is DEAD (exit code {rc})")
+            return False
+        log.debug(f"[{context}] daemon alive (pid={daemon_proc.pid})")
+        return True
 
     @app.get("/v1/models")
     def list_models():
@@ -166,9 +209,6 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         prompt = tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=True)
         ids = tokenizer.encode(prompt, add_special_tokens=False)
-        # mkstemp returns (fd, path). The previous code kept only the
-        # path and discarded fd, leaking 1 file descriptor per request.
-        # os.fdopen() takes ownership of the fd and closes it on __exit__.
         fd, path = tempfile.mkstemp(suffix=".bin")
         tmp = Path(path)
         with os.fdopen(fd, "wb") as f:
@@ -182,30 +222,55 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         while True:
             b = os.read(r, 4)
             if not b or len(b) < 4:
+                log.warning(f"[token_stream] short/empty read: got {len(b) if b else 0} bytes "
+                            f"(generated {generated}/{n_gen} tokens so far)")
                 break
             tok_id = struct.unpack("<i", b)[0]
             if tok_id == -1:
+                log.debug(f"[token_stream] received sentinel -1 after {generated} tokens")
                 break
             if hit_stop:
                 continue
             if tok_id in stop_ids:
+                log.debug(f"[token_stream] stop token {tok_id} after {generated} tokens")
                 hit_stop = True
                 continue
             generated += 1
             yield tok_id
             if generated >= n_gen:
+                log.debug(f"[token_stream] reached gen limit {n_gen}")
                 hit_stop = True
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
-        prompt_bin = _tokenize_prompt(req)
-        
+        log.info(f"[chat] new request: stream={req.stream}, max_tokens={req.max_tokens}, "
+                 f"messages={len(req.messages)}")
+
+        if not _check_daemon("chat pre-tokenize"):
+            return JSONResponse(
+                {"error": {"message": "Backend daemon is not running (crashed after previous request). "
+                                      "Check server logs for [daemon stderr] lines.",
+                           "type": "server_error"}},
+                status_code=503)
+
+        try:
+            prompt_bin = _tokenize_prompt(req)
+        except Exception as exc:
+            log.error(f"[chat] tokenization failed: {exc}\n{traceback.format_exc()}")
+            return JSONResponse({"error": {"message": f"Tokenization error: {exc}",
+                                           "type": "server_error"}}, status_code=500)
+
         # Clamp max_tokens to available headroom
         prompt_len = prompt_bin.stat().st_size // 4
-        # Safety buffer for the dflash block_size (16)
         available_gen = max_ctx - prompt_len - 20
         gen_len = min(req.max_tokens, available_gen)
+
+        log.info(f"[chat] prompt_len={prompt_len}, max_ctx={max_ctx}, "
+                 f"available_gen={available_gen}, gen_len={gen_len}")
+
         if gen_len <= 0:
+            try: prompt_bin.unlink()
+            except Exception: pass
             return JSONResponse({"detail": f"Prompt length ({prompt_len}) exceeds max_ctx ({max_ctx})"}, status_code=400)
 
         completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -214,9 +279,21 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         if req.stream:
             async def sse() -> AsyncIterator[str]:
                 async with daemon_lock:
+                    if not _check_daemon("chat sse (inside lock)"):
+                        yield f"data: {json.dumps({'error': 'daemon dead'})}\n\n"
+                        return
+
                     cmd_line = f"{prompt_bin} {gen_len}\n"
-                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+                    log.debug(f"[chat sse] sending to daemon stdin: {cmd_line.strip()}")
+                    try:
+                        daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                        daemon_proc.stdin.flush()
+                    except (BrokenPipeError, OSError) as exc:
+                        log.error(f"[chat sse] stdin write failed: {exc}")
+                        _check_daemon("chat sse post-write")
+                        yield f"data: {json.dumps({'error': f'daemon stdin write failed: {exc}'})}\n\n"
+                        return
+
                     head = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": MODEL_NAME,
@@ -225,10 +302,10 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                                       "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(head)}\n\n"
+                    tok_count = 0
                     try:
-                        # Offload blocking os.read in _token_stream to a thread so
-                        # SSE chunks flush progressively instead of after generation ends.
                         async for tok_id in iterate_in_threadpool(_token_stream(r_pipe, gen_len)):
+                            tok_count += 1
                             chunk = {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
@@ -238,7 +315,11 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                                               "finish_reason": None}],
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
+                    except Exception as exc:
+                        log.error(f"[chat sse] error during token streaming: {exc}\n{traceback.format_exc()}")
+                        _check_daemon("chat sse post-error")
                     finally:
+                        log.info(f"[chat sse] streamed {tok_count} tokens total")
                         try: prompt_bin.unlink()
                         except Exception: pass
                     tail = {
@@ -249,19 +330,42 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                     }
                     yield f"data: {json.dumps(tail)}\n\n"
                     yield "data: [DONE]\n\n"
+                    _check_daemon("chat sse done")
 
             return StreamingResponse(sse(), media_type="text/event-stream")
 
         # Non-streaming: collect all tokens, return one response
         async with daemon_lock:
+            if not _check_daemon("chat non-stream (inside lock)"):
+                try: prompt_bin.unlink()
+                except Exception: pass
+                return JSONResponse(
+                    {"error": {"message": "Backend daemon is not running.",
+                               "type": "server_error"}},
+                    status_code=503)
+
             cmd_line = f"{prompt_bin} {gen_len}\n"
-            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-            daemon_proc.stdin.flush()
+            log.debug(f"[chat non-stream] sending to daemon stdin: {cmd_line.strip()}")
+            try:
+                daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                daemon_proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                log.error(f"[chat non-stream] stdin write failed: {exc}")
+                _check_daemon("chat non-stream post-write")
+                try: prompt_bin.unlink()
+                except Exception: pass
+                return JSONResponse(
+                    {"error": {"message": f"daemon stdin write failed: {exc}",
+                               "type": "server_error"}},
+                    status_code=503)
+
             tokens = list(_token_stream(r_pipe, gen_len))
-            
+            log.info(f"[chat non-stream] collected {len(tokens)} tokens")
+
         try: prompt_bin.unlink()
         except Exception: pass
         text = tokenizer.decode(tokens, skip_special_tokens=True)
+        _check_daemon("chat non-stream done")
         return JSONResponse({
             "id": completion_id,
             "object": "chat.completion",
@@ -272,9 +376,9 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                 "message": {"role": "assistant", "content": text},
                 "finish_reason": "stop",
             }],
-            "usage": {"prompt_tokens": 0,  # not tracked yet
+            "usage": {"prompt_tokens": prompt_len,
                       "completion_tokens": len(tokens),
-                      "total_tokens": len(tokens)},
+                      "total_tokens": prompt_len + len(tokens)},
         })
 
     # ── Anthropic Messages API ──────────────────────────────────────
@@ -302,7 +406,6 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         prompt = tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=True)
         ids = tokenizer.encode(prompt, add_special_tokens=False)
-        # mkstemp returns (fd, path); discarding fd leaks 1 per request (#15).
         fd, path = tempfile.mkstemp(suffix=".bin")
         tmp = Path(path)
         with os.fdopen(fd, "wb") as f:
@@ -318,26 +421,54 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
         while True:
             b = await asyncio.to_thread(os.read, r, 4)
             if not b or len(b) < 4:
+                log.warning(f"[astream_tokens] short/empty read: got {len(b) if b else 0} bytes "
+                            f"(generated {generated}/{n_gen} tokens so far)")
                 break
             tok_id = struct.unpack("<i", b)[0]
             if tok_id == -1:
+                log.debug(f"[astream_tokens] received sentinel -1 after {generated} tokens")
                 break
             if hit_stop:
                 continue
             if tok_id in stop_ids:
+                log.debug(f"[astream_tokens] stop token {tok_id} after {generated} tokens")
                 hit_stop = True
                 continue
             generated += 1
             yield tok_id
             if generated >= n_gen:
+                log.debug(f"[astream_tokens] reached gen limit {n_gen}")
                 hit_stop = True
 
     @app.post("/v1/messages")
     async def anthropic_messages(req: AnthropicMessagesRequest):
-        prompt_bin, prompt_len = _tokenize_anthropic(req)
+        log.info(f"[anthropic] new request: stream={req.stream}, max_tokens={req.max_tokens}, "
+                 f"messages={len(req.messages)}")
+
+        if not _check_daemon("anthropic pre-tokenize"):
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "server_error",
+                           "message": "Backend daemon is not running (crashed after previous request). "
+                                      "Check server logs for [daemon stderr] lines."}},
+                status_code=503)
+
+        try:
+            prompt_bin, prompt_len = _tokenize_anthropic(req)
+        except Exception as exc:
+            log.error(f"[anthropic] tokenization failed: {exc}\n{traceback.format_exc()}")
+            return JSONResponse(
+                {"type": "error",
+                 "error": {"type": "server_error",
+                           "message": f"Tokenization error: {exc}"}},
+                status_code=500)
 
         available_gen = max_ctx - prompt_len - 20
         gen_len = min(req.max_tokens, available_gen)
+
+        log.info(f"[anthropic] prompt_len={prompt_len}, max_ctx={max_ctx}, "
+                 f"available_gen={available_gen}, gen_len={gen_len}")
+
         if gen_len <= 0:
             try: prompt_bin.unlink()
             except Exception: pass
@@ -351,9 +482,13 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
 
         if req.stream:
             async def sse() -> AsyncIterator[str]:
-                # Hold the lock across the ENTIRE read cycle so concurrent
-                # requests don't interleave tokens through the shared pipe.
                 async with daemon_lock:
+                    if not _check_daemon("anthropic sse (inside lock)"):
+                        err = {"type": "error", "error": {"type": "server_error",
+                               "message": "daemon dead"}}
+                        yield f"event: error\ndata: {json.dumps(err)}\n\n"
+                        return
+
                     message_start = {
                         "type": "message_start",
                         "message": {
@@ -372,8 +507,14 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                     yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
 
                     cmd_line = f"{prompt_bin} {gen_len}\n"
-                    daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-                    daemon_proc.stdin.flush()
+                    log.debug(f"[anthropic sse] sending to daemon stdin: {cmd_line.strip()}")
+                    try:
+                        daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                        daemon_proc.stdin.flush()
+                    except (BrokenPipeError, OSError) as exc:
+                        log.error(f"[anthropic sse] stdin write failed: {exc}")
+                        _check_daemon("anthropic sse post-write")
+                        return
 
                     out_tokens = 0
                     try:
@@ -385,7 +526,12 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                                           "text": tokenizer.decode([tok_id])},
                             }
                             yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                    except Exception as exc:
+                        log.error(f"[anthropic sse] error during token streaming: {exc}\n"
+                                  f"{traceback.format_exc()}")
+                        _check_daemon("anthropic sse post-error")
                     finally:
+                        log.info(f"[anthropic sse] streamed {out_tokens} tokens total")
                         try: prompt_bin.unlink()
                         except Exception: pass
 
@@ -398,19 +544,44 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int, max_ctx: i
                     }
                     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
                     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+                    _check_daemon("anthropic sse done")
 
             return StreamingResponse(sse(), media_type="text/event-stream")
 
         # Non-streaming
         async with daemon_lock:
+            if not _check_daemon("anthropic non-stream (inside lock)"):
+                try: prompt_bin.unlink()
+                except Exception: pass
+                return JSONResponse(
+                    {"type": "error",
+                     "error": {"type": "server_error",
+                               "message": "Backend daemon is not running."}},
+                    status_code=503)
+
             cmd_line = f"{prompt_bin} {gen_len}\n"
-            daemon_proc.stdin.write(cmd_line.encode("utf-8"))
-            daemon_proc.stdin.flush()
+            log.debug(f"[anthropic non-stream] sending to daemon stdin: {cmd_line.strip()}")
+            try:
+                daemon_proc.stdin.write(cmd_line.encode("utf-8"))
+                daemon_proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                log.error(f"[anthropic non-stream] stdin write failed: {exc}")
+                _check_daemon("anthropic non-stream post-write")
+                try: prompt_bin.unlink()
+                except Exception: pass
+                return JSONResponse(
+                    {"type": "error",
+                     "error": {"type": "server_error",
+                               "message": f"daemon stdin write failed: {exc}"}},
+                    status_code=503)
+
             tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
+            log.info(f"[anthropic non-stream] collected {len(tokens)} tokens")
 
         try: prompt_bin.unlink()
         except Exception: pass
         text = tokenizer.decode(tokens, skip_special_tokens=True)
+        _check_daemon("anthropic non-stream done")
         return JSONResponse({
             "id": msg_id,
             "type": "message",
@@ -434,11 +605,6 @@ def main():
     ap.add_argument("--draft",  type=Path, default=DEFAULT_DRAFT_ROOT)
     ap.add_argument("--bin",    type=Path, default=DEFAULT_BIN)
     ap.add_argument("--budget", type=int,  default=DEFAULT_BUDGET)
-    # Attention compute currently scales with --max-ctx, not the actual
-    # prompt+gen length (see https://github.com/Luce-Org/lucebox-hub/issues/10).
-    # Default 16384 fits most API workloads without the 20×+ slowdown users
-    # hit with --max-ctx=131072 on short requests. Bump via --max-ctx if you
-    # actually need long-context serving.
     default_ctx = 16384
     ap.add_argument("--max-ctx", type=int, default=default_ctx,
                     help=f"Maximum context length (default: {default_ctx}; "
@@ -458,10 +624,6 @@ def main():
     ap.add_argument("--daemon", action="store_true", help="Run with persistent model daemon (now default)")
     args = ap.parse_args()
 
-    # Auto-enable TQ3_0 KV cache when the requested context exceeds what F16 fits.
-    # Clients like Claude Code routinely send 10k+ token system prompts, so
-    # 6144 is too tight for real-world use. setdefault so an explicit user
-    # DFLASH27B_KV_TQ3=0 still wins.
     if args.max_ctx > 6144 and not args.kv_f16:
         os.environ.setdefault("DFLASH27B_KV_TQ3", "1")
 
@@ -482,6 +644,8 @@ def main():
     for s in ("<|im_end|>", "<|endoftext|>"):
         ids = tokenizer.encode(s, add_special_tokens=False)
         if ids: stop_ids.add(ids[0])
+
+    log.info(f"Stop token IDs: {stop_ids}")
 
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids)
